@@ -1,0 +1,34 @@
+#!/bin/bash
+# PBS job for Vanda (NUS HPC): bc_omp_gpu on 1 NVIDIA A40 through the charged batch_gpu queue
+# (auto routes any job with ngpus >= 1 there), with CPU baselines on the same node first.
+# Half a GPU node: 36 of its 72 cores and 1 of its 2 A40s.
+#   qsub vanda_gpu_charged.pbs      results in results/gpu/device.csv and results/gpu/sources.csv
+#PBS -N bc-gpu-c
+#PBS -q auto
+#PBS -l select=1:ncpus=36:mpiprocs=36:ngpus=1:mem=180gb
+#PBS -l walltime=03:00:00
+#PBS -j oe
+#PBS -o bc-gpu-charged.log
+set -euo pipefail
+R=$PBS_O_WORKDIR; W=$R/run/${PBS_JOBID%%.*}  # private copy: jobs cannot overwrite each other's programs
+mkdir -p "$W" && cp "$R"/*.cpp "$R"/run.sh "$W"/ && ln -sfn "$R"/data "$W"/data && cd "$W"
+module purge
+module load nvhpc-hpcx-cuda12/26.1
+export HOSTFILE=$PBS_NODEFILE G_MAX=1 P_MAX=36
+export OMPI_MCA_coll_hcoll_enable=0
+export RUN_TIMEOUT=3600
+nvidia-smi --query-gpu=name,memory.total --format=csv
+lscpu | grep -E "Model name|^CPU\(s\)|Socket"
+./run.sh build
+./run.sh validate                            # includes bc_omp_gpu against serial
+[ -f data/rmat_s20.el ] || bin/graphs rmat 20 16 data/rmat_s20.el 1
+[ -f data/er_s20.el ] || bin/graphs er 1048576 16 data/er_s20.el 1
+# 1. same graph and sources on every processor of this node: bc_serial (1 core), bc_mpi (36 cores,
+#    whole sources), bc_omp (36 cores sharing one BFS, the GPU's algorithm), bc_omp_gpu (1 A40)
+CSV=$R/results/gpu/device.csv ./run.sh device data/facebook.el
+CSV=$R/results/gpu/device.csv ./run.sh device data/twitter.el 8192
+CSV=$R/results/gpu/device.csv REPS=2 ./run.sh device data/rmat_s20.el 1024
+CSV=$R/results/gpu/device.csv REPS=2 ./run.sh device data/er_s20.el 1024    # uniform degrees: no warp imbalance
+# 2. GPU against the number of sources (Twitter): fixed cost (start-up, graph copy) vs cost per source
+for K in 1024 2048 4096; do CSV=$R/results/gpu/sources.csv REPS=2 ./run.sh gpu data/twitter.el $K; done
+echo "== done $(date)"

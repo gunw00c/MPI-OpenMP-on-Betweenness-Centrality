@@ -1,0 +1,76 @@
+#!/bin/bash
+# PBS job for Vanda (NUS HPC): strong and weak scaling of bc_mpi, and MPI + OpenMP, on 1 to 256
+# cores (4 nodes x 64 MPI ranks; the CPU nodes have 72 cores). The free queues stop at 160 CPUs,
+# so this goes through auto to batch_cpu (charged).   qsub vanda.pbs     results in results/mpi/, results/hybrid/
+#PBS -N bc-256
+#PBS -q auto
+#PBS -l select=4:ncpus=72:mpiprocs=64:mem=200gb
+#PBS -l place=scatter:excl
+#PBS -l walltime=06:00:00
+#PBS -j oe
+#PBS -o bc-256.log
+set -euo pipefail
+R=$PBS_O_WORKDIR; W=$R/run/${PBS_JOBID%%.*}  # private copy: jobs cannot overwrite each other's programs
+mkdir -p "$W" && cp "$R"/*.cpp "$R"/run.sh "$W"/ && ln -sfn "$R"/data "$W"/data && cd "$W"
+module purge
+module load nvhpc-hpcx-cuda12/26.1
+export HOSTFILE=$PBS_NODEFILE PPN=64 P_MAX=$(wc -l < "$PBS_NODEFILE")
+export OMPI_MCA_coll_hcoll_enable=0          # HPC-X collectives library fails to start here
+export RUN_TIMEOUT=1800                      # a run that hangs is killed after 30 min, not 6 h
+lscpu | grep -E "Model name|^CPU\(s\)|Socket|NUMA node\(s\)"; mpicxx --version | head -2
+./run.sh build
+bin/bc_serial data/facebook.el -k 512 -o check.serial > /dev/null
+# Choosing the transport between nodes. Runs over 2 nodes hung with both UCX and TCP: the UCC
+# collectives open their own UCX connections, whose default transport cannot reach the other
+# node ("Destination is unreachable"). On Vanda, UCX restricted to TCP on the 100G Ethernet
+# (ens6f1) works. Try each network of this node (fastest link first) with 2 ranks on 2 nodes,
+# plain TCP then UCX over TCP, and keep the first whose result matches bc_serial.
+echo "== networks"
+for h in $(sort -u "$HOSTFILE"); do
+    timeout 30 ssh -o StrictHostKeyChecking=no "$h" 'echo "-- $(hostname)"; ip -br -4 addr | grep -v "^lo"' || true
+done
+net_of() {  # 192.168.22.157/23 -> 192.168.22.0/23
+    local p=${1#*/} a b c d x; IFS=. read -r a b c d <<< "${1%/*}"
+    x=$(( (a << 24 | b << 16 | c << 8 | d) & (0xffffffff << (32 - p)) & 0xffffffff ))
+    echo "$((x >> 24 & 255)).$((x >> 16 & 255)).$((x >> 8 & 255)).$((x & 255))/$p"
+}
+try() {  # mpirun options -> 0 if 2 ranks on 2 nodes finish and match bc_serial
+    rm -f check.2
+    timeout -k 10 90 mpirun --hostfile "$HOSTFILE" --map-by ppr:1:node -np 2 "$@" \
+        bin/bc_mpi data/facebook.el -k 512 -o check.2 > try.out 2>&1 &&
+        bin/validate check.2 check.serial > /dev/null
+}
+MPI_OPTS=
+while read -r speed dev cidr; do
+    net=$(net_of "$cidr")
+    opts="--mca pml ob1 --mca btl self,vader,tcp --mca btl_tcp_if_include $net --mca oob_tcp_if_include $net"
+    echo "trying TCP on $dev $net (link ${speed} Mb/s)"
+    if try $opts; then MPI_OPTS=$opts; break; fi
+    tail -5 try.out
+    opts="--mca pml ucx -x UCX_TLS=self,sm,tcp -x UCX_NET_DEVICES=$dev --mca oob_tcp_if_include $net"
+    echo "trying UCX over TCP on $dev"
+    if try $opts; then MPI_OPTS=$opts; break; fi
+    tail -5 try.out
+done < <(ip -o -4 addr show scope global | awk '{print $2, $4}' | while read -r dev cidr; do
+             echo "$(cat /sys/class/net/$dev/speed 2>/dev/null || echo 0) $dev $cidr"; done | sort -rn)
+[ -n "$MPI_OPTS" ] || { echo "no network connects the nodes"; exit 1; }
+echo "using: $MPI_OPTS"; export MPI_OPTS
+# then 128 and 256 ranks must finish and match bc_serial, or stop here
+for np in 128 256; do
+    timeout -k 10 300 mpirun --hostfile "$HOSTFILE" $MPI_OPTS --map-by ppr:64:node --bind-to core -np $np \
+        bin/bc_mpi data/facebook.el -k 512 -o check.$np | grep '^RESULT'
+    bin/validate check.$np check.serial || { echo "multi-node check failed at $np ranks"; exit 1; }
+done
+[ -f data/rmat_s20.el ] || bin/graphs rmat 20 16 data/rmat_s20.el 1
+[ -f data/er_s20.el ] || bin/graphs er 1048576 16 data/er_s20.el 1
+# strong scaling, pure MPI (1 thread per rank), bc_serial recorded in the same job as the baseline
+CSV=$R/results/mpi/strong.csv ./run.sh strong data/twitter.el 8192
+CSV=$R/results/mpi/strong.csv ./run.sh strong data/facebook.el
+CSV=$R/results/mpi/strong.csv REPS=2 ./run.sh strong data/rmat_s20.el 1024
+CSV=$R/results/mpi/strong.csv REPS=2 ./run.sh strong data/er_s20.el 1024    # same size, uniform degrees
+# weak scaling: R-MAT scale 14 at 1 core -> 22 at 256 cores; fixed scale 18 with 64 sources per core
+CSV=$R/results/mpi/weak_graph.csv SCALE=14 K=1024 ./run.sh weak graph
+CSV=$R/results/mpi/weak_sources.csv SCALE=18 K=64 ./run.sh weak sources
+# MPI + OpenMP on the same cores: 4 and 16 threads per rank
+CSV=$R/results/hybrid/strong.csv TPR=4 ./run.sh strong data/twitter.el 8192
+CSV=$R/results/hybrid/strong.csv TPR=16 ./run.sh strong data/twitter.el 8192

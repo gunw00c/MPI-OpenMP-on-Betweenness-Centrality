@@ -1,0 +1,24 @@
+#!/bin/bash
+# PBS job for Vanda (NUS HPC): serial complexity tests T1-T4 and brute force vs Brandes, on one
+# whole CPU node (exclusive, so no other job shares its memory bandwidth). auto_free routes it to the free cpu_parallel queue.
+#   qsub vanda_serial.pbs           results in results/serial/
+#PBS -N bc-serial
+#PBS -q auto_free
+#PBS -l select=1:ncpus=64:mem=200gb
+#PBS -l place=excl
+#PBS -l walltime=04:00:00
+#PBS -j oe
+#PBS -o bc-serial.log
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+module purge
+module load nvhpc-hpcx-cuda12/26.1
+export HOSTFILE=$PBS_NODEFILE OMPI_MCA_coll_hcoll_enable=0
+
+hostname; lscpu | grep -E "Model name|^CPU\(s\)|Socket|NUMA node\(s\)|L3"; mpicxx --version | head -2
+./run.sh build
+./run.sh validate
+CSV=results/serial/complexity.csv ./run.sh complexity     # T1 (time vs k), T4 (exact BC vs n)
+CSV=results/serial/size.csv ./run.sh size                 # T2 (time vs m), T3 (time vs n)
+CSV=results/serial/brute.csv ./run.sh brute data/facebook.el

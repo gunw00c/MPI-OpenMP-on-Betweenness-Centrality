@@ -1,0 +1,25 @@
+#!/bin/bash
+# PBS job for Vanda (NUS HPC): validation and bc_omp with one BFS shared by 1 to 64 threads
+# on one CPU node. auto_free routes it to the free cpu_parallel queue.
+#   qsub vanda_omp.pbs              results in results/omp/
+#PBS -N bc-omp
+#PBS -q auto_free
+#PBS -l select=1:ncpus=64:mpiprocs=64:mem=200gb
+#PBS -l place=excl
+#PBS -l walltime=08:00:00
+#PBS -j oe
+#PBS -o bc-omp.log
+set -euo pipefail
+R=$PBS_O_WORKDIR; W=$R/run/${PBS_JOBID%%.*}  # private copy: jobs cannot overwrite each other's programs
+mkdir -p "$W" && cp "$R"/*.cpp "$R"/run.sh "$W"/ && ln -sfn "$R"/data "$W"/data && cd "$W"
+module purge
+module load nvhpc-hpcx-cuda12/26.1
+export HOSTFILE=$PBS_NODEFILE P_MAX=64
+export OMPI_MCA_coll_hcoll_enable=0          # HPC-X collectives library fails to start here
+export RUN_TIMEOUT=3600
+lscpu | grep -E "Model name|^CPU\(s\)|Socket|NUMA node\(s\)"; mpicxx --version | head -2
+./run.sh build
+./run.sh validate
+# fine-grained OpenMP: 1 rank, 1 .. 64 threads on one BFS at a time
+CSV=$R/results/omp/fine.csv T_MAX=64 ./run.sh fine data/twitter.el 1024
+CSV=$R/results/omp/fine.csv T_MAX=64 ./run.sh fine data/facebook.el
