@@ -123,6 +123,5 @@ qstat -u $USER           # job status
 | `vanda.pbs` | `bc-256.log` | `results/mpi/`, `results/hybrid/` |
 | `vanda_omp.pbs` | `bc-omp.log` | `results/omp/` |
 | `vanda_gpu_charged.pbs` | `bc-gpu-charged.log` | `results/gpu/device.csv`, `results/gpu/sources.csv` |
-| `vanda_net.pbs` | `bc-net.log` | none: compares MPI network settings on 2 nodes |
 
 Before the experiments, `vanda.pbs` looks for an MPI transport that connects the nodes: it tries 2 ranks on 2 nodes, then checks 128 and 256 ranks against `bc_serial`, and stops if any of these checks fails.
